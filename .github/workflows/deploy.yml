@@ -1,0 +1,207 @@
+name: Deploy Application
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "backend/**"
+      - "frontend/**"
+      - "docker-compose.yml"
+      - ".github/workflows/deploy.yml"
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-1
+  NODE_VERSION: 18
+  TF_VERSION: 1.6.0
+
+jobs:
+  get-infrastructure:
+    name: Get Infrastructure Info
+    runs-on: ubuntu-latest
+    outputs:
+      cloudfront_url: ${{ steps.terraform.outputs.cloudfront_url }}
+      s3_bucket: ${{ steps.terraform.outputs.s3_bucket }}
+      ec2_ip: ${{ steps.terraform.outputs.ec2_ip }}
+      cloudfront_id: ${{ steps.terraform.outputs.cloudfront_id }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: ${{ env.TF_VERSION }}
+          terraform_wrapper: false
+
+      - name: Get Terraform Outputs
+        id: terraform
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          terraform output -json > outputs.json
+
+          echo "cloudfront_url=$(jq -r '.frontend_url.value' outputs.json)" >> $GITHUB_OUTPUT
+          echo "s3_bucket=$(jq -r '.s3_bucket_name.value' outputs.json)" >> $GITHUB_OUTPUT
+          echo "cloudfront_id=$(jq -r '.cloudfront_distribution_id.value' outputs.json)" >> $GITHUB_OUTPUT
+          echo "ec2_ip=$(jq -r '.backend_public_ip.value' outputs.json)" >> $GITHUB_OUTPUT
+
+  deploy-backend:
+    name: Deploy Backend
+    needs: get-infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get SSH Key
+        run: |
+          aws secretsmanager get-secret-value \
+            --secret-id train-app-prod-ssh-key \
+            --query SecretString \
+            --output text > deploy-key.pem
+          chmod 600 deploy-key.pem
+
+      - name: Create Deployment Package
+        run: |
+          tar -czf app.tar.gz backend/ docker-compose.yml init-db.sql .env.template
+
+      - name: Deploy to EC2
+        env:
+          EC2_IP: ${{ needs.get-infrastructure.outputs.ec2_ip }}
+          DB_PASSWORD: ${{ secrets.DB_PASSWORD }}
+          JWT_SECRET: ${{ secrets.JWT_SECRET }}
+        run: |
+          # Copy files
+          scp -o StrictHostKeyChecking=no -i deploy-key.pem \
+            app.tar.gz ec2-user@$EC2_IP:/home/ec2-user/
+
+          # Deploy
+          ssh -o StrictHostKeyChecking=no -i deploy-key.pem ec2-user@$EC2_IP << ENDSSH
+            cd /home/ec2-user
+            
+            # Backup current deployment
+            [ -d app ] && mv app app.backup.\$(date +%Y%m%d-%H%M%S)
+            
+            # Extract new deployment
+            mkdir -p app
+            tar -xzf app.tar.gz -C app
+            cd app
+            
+            # Create .env file
+            install -m 600 /dev/null .env
+            printf '%s\n' \
+              'NODE_ENV=production' \
+              'DB_USERNAME=trainuser' \
+              "DB_PASSWORD=$DB_PASSWORD" \
+              'DB_NAME=traindb' \
+              "JWT_SECRET=$JWT_SECRET" \
+              'JWT_EXPIRES_IN=24h' \
+              > .env
+            
+            # Deploy containers
+            docker-compose down || true
+            docker system prune -af --volumes
+            docker-compose build --no-cache backend
+            docker-compose up -d
+            
+            # Show status
+            docker-compose ps
+            docker-compose logs backend --tail 20
+          ENDSSH
+
+      - name: Cleanup
+        if: always()
+        run: rm -f deploy-key.pem
+
+  deploy-frontend:
+    name: Deploy Frontend
+    needs: get-infrastructure
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ env.NODE_VERSION }}
+
+      - name: Configure AWS Credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Build Frontend
+        working-directory: frontend
+        env:
+          NEXT_PUBLIC_API_URL: ${{ needs.get-infrastructure.outputs.cloudfront_url }}/api
+        run: |
+          npm install
+          npm run build
+
+          # Verify build
+          [ ! -d "out" ] && echo "Build failed" && exit 1
+          echo "Build successful - $(find out -type f | wc -l) files"
+
+      - name: Deploy to S3
+        working-directory: frontend
+        env:
+          S3_BUCKET: ${{ needs.get-infrastructure.outputs.s3_bucket }}
+        run: |
+          # Static assets - long cache
+          aws s3 sync out/ s3://$S3_BUCKET/ \
+            --delete \
+            --cache-control "public, max-age=31536000" \
+            --exclude "*.html" \
+            --exclude "*.json"
+
+          # HTML files - no cache
+          aws s3 sync out/ s3://$S3_BUCKET/ \
+            --exclude "*" \
+            --include "*.html" \
+            --cache-control "public, max-age=0, must-revalidate" \
+            --content-type "text/html"
+
+          # JSON files - no cache
+          aws s3 sync out/ s3://$S3_BUCKET/ \
+            --exclude "*" \
+            --include "*.json" \
+            --cache-control "no-cache, no-store, must-revalidate"
+
+      - name: Invalidate CloudFront
+        env:
+          CLOUDFRONT_ID: ${{ needs.get-infrastructure.outputs.cloudfront_id }}
+        run: |
+          aws cloudfront create-invalidation \
+            --distribution-id $CLOUDFRONT_ID \
+            --paths "/*"
+
+      - name: Deployment Summary
+        if: success()
+        run: |
+          echo "# 🚀 Deployment Successful!" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "**Application URL**: ${{ needs.get-infrastructure.outputs.cloudfront_url }}" >> $GITHUB_STEP_SUMMARY
+          echo "**API Endpoint**: ${{ needs.get-infrastructure.outputs.cloudfront_url }}/api" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "Deployed at: $(date)" >> $GITHUB_STEP_SUMMARY
